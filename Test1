@@ -1,0 +1,320 @@
+/**
+ * MHS CORE · F1 Haushaltsführung · API-Worker v1.0
+ * Cloudflare Worker + D1
+ *
+ * Einstellungen im Worker (Settings → Bindings / Variables and Secrets):
+ *   DB              D1-Binding (Pflicht) → Datenbank mhscore-f1
+ *   APP_PASSWORD    Secret  – dein Login-Passwort (mind. 16 Zeichen)
+ *   TOKEN_SECRET    Secret  – zufällige Zeichenkette, mind. 32 Zeichen
+ *   ALLOWED_ORIGIN  Text    – Adresse der Oberfläche, z. B. https://f1-haushalt.pages.dev
+ *                             (mehrere mit Komma; "null" erlaubt Öffnen als lokale Datei)
+ *
+ * Sicherheit:
+ *   - Login per Passwort → signiertes Sitzungs-Token (HMAC-SHA256, 12 h bzw. 14 Tage)
+ *   - Sperre nach 5 Fehlversuchen pro IP / 30 insgesamt in 15 Minuten
+ *   - Nur freigegebene Tabellen und Spalten, ausschließlich Prepared Statements
+ *   - CORS nur für ALLOWED_ORIGIN, Größenlimits, Typprüfung aller Felder
+ *
+ * Erweiterbarkeit:
+ *   Unbekannte Felder aus der Oberfläche landen automatisch in der Spalte "extra" (JSON)
+ *   und kommen beim Lesen wieder als normale Felder zurück. Neue Eingabefelder in der
+ *   HTML brauchen daher weder eine Worker- noch eine Datenbankänderung.
+ */
+
+const SCHEMA = {
+  konten: { name: 'text!', typ: 'text', institut: 'text', iban: 'text', eroeffnung: 'date', anfangssaldo: 'money', ist_hauptkonto: 'bool', aktiv: 'bool', sort: 'int', notiz: 'text' },
+  kontostaende: { konto_id: 'id!', datum: 'date!', saldo: 'money!', notiz: 'text' },
+  fixkosten: { name: 'text!', kategorie: 'text', betrag: 'money!', intervall: 'text!', beginn: 'date', erste_faelligkeit: 'date', ende: 'date', faellig_tag: 'int', mindestlaufzeit_monate: 'int', kuendigungsfrist_wert: 'int', kuendigungsfrist_einheit: 'text', verlaengerung_monate: 'int', zahlart: 'text', konto_id: 'id', vertragsnr: 'text', kommentar: 'text', aktiv: 'bool' },
+  ausgaben: { datum: 'date!', zweck: 'text!', kategorie: 'text', betrag: 'money!', art: 'text!', konto_id: 'id', notiz: 'text' },
+  einnahmen: { datum: 'date!', art: 'text!', bezeichnung: 'text', betrag: 'money!', konto_id: 'id', notiz: 'text' },
+  umbuchungen: { datum: 'date!', von_konto_id: 'id!', an_konto_id: 'id!', betrag: 'money!', zweck: 'text' },
+  rueckstellungen: { bezeichnung: 'text!', betrag: 'money!', modus: 'text!', rhythmus: 'text!', beginn: 'date!', ende: 'date', von_konto_id: 'id', ziel_konto_id: 'id', notiz: 'text' },
+  einstellungen: { wert: 'long' }
+};
+const TABLES = Object.keys(SCHEMA);
+
+const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const KEY_RE = /^[a-z][a-z0-9_]{0,40}$/;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const RESERVED = new Set(['id', 'extra', 'created_at', 'updated_at']);
+const TEXT_MAX = 2000, LONG_MAX = 20000, EXTRA_MAX = 8000, BODY_MAX = 1_000_000;
+const IMPORT_MAX_ROWS = 45;
+const SESSION_H = 12, REMEMBER_H = 24 * 14;
+
+class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+
+export default {
+  async fetch(request, env) {
+    const origin = request.headers.get('Origin');
+    const allowed = (env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
+    const cors = origin && allowed.includes(origin) ? corsFor(origin) : {};
+
+    if (origin && !cors['Access-Control-Allow-Origin']) {
+      return json({ error: 'Zugriff von dieser Adresse nicht erlaubt (ALLOWED_ORIGIN prüfen).' }, 403);
+    }
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...baseHeaders(), ...cors } });
+
+    try {
+      return withCors(await route(request, env), cors);
+    } catch (e) {
+      if (!e.status) console.error(e);
+      return json({ error: e.status ? e.message : 'Interner Fehler' }, e.status || 500, cors);
+    }
+  }
+};
+
+async function route(request, env) {
+  const url = new URL(request.url);
+  const path = url.pathname.replace(/\/+$/, '');
+  const m = request.method;
+
+  if (path === '/api/health' && m === 'GET') return json({ ok: true, app: 'F1', konfiguriert: configured(env) });
+  if (!configured(env)) throw new HttpError(500, 'Worker nicht vollständig eingerichtet (DB, APP_PASSWORD, TOKEN_SECRET ≥ 32 Zeichen).');
+  if (path === '/api/login' && m === 'POST') return login(request, env);
+
+  const session = await requireAuth(request, env);
+
+  if (path === '/api/session' && m === 'GET') return json({ ok: true, exp: session.exp });
+  if (path === '/api/data' && m === 'GET') return getData(env);
+  if (path === '/api/import' && m === 'POST') return importRows(request, env);
+
+  let r = path.match(/^\/api\/t\/([a-z_]+)$/);
+  if (r && m === 'PUT') {
+    const table = tableOf(r[1]);
+    const body = await readJson(request);
+    const row = clean(table, body);
+    await upsertStmt(env, table, row).run();
+    return json({ ok: true, row: out(row) });
+  }
+  r = path.match(/^\/api\/t\/([a-z_]+)\/([A-Za-z0-9_-]{1,64})$/);
+  if (r && m === 'DELETE') {
+    const table = tableOf(r[1]);
+    const res = await env.DB.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(r[2]).run();
+    return json({ ok: true, deleted: res.meta?.changes ?? 0 });
+  }
+  throw new HttpError(404, 'Nicht gefunden');
+}
+
+/* ---------- Login & Sitzung ---------- */
+async function login(request, env) {
+  const body = await readJson(request, 4096);
+  const ip = request.headers.get('CF-Connecting-IP') || 'unbekannt';
+  const now = Date.now();
+  const r = await env.DB.prepare(
+    'SELECT COUNT(*) AS n, SUM(CASE WHEN ip = ?1 THEN 1 ELSE 0 END) AS mine FROM login_versuche WHERE ts > ?2'
+  ).bind(ip, now - 15 * 60 * 1000).first();
+  if ((r?.mine || 0) >= 5 || (r?.n || 0) >= 30) throw new HttpError(429, 'Zu viele Fehlversuche. Bitte 15 Minuten warten.');
+
+  const pw = typeof body.password === 'string' ? body.password : '';
+  const ok = pw.length > 0 && pw.length <= 256 && await passwordOk(env, pw);
+  if (!ok) {
+    await env.DB.batch([
+      env.DB.prepare('INSERT INTO login_versuche (ip, ts) VALUES (?, ?)').bind(ip, now),
+      env.DB.prepare('DELETE FROM login_versuche WHERE ts < ?').bind(now - 86400000)
+    ]);
+    await new Promise(res => setTimeout(res, 400 + Math.floor(Math.random() * 300)));
+    throw new HttpError(401, 'Passwort falsch.');
+  }
+  await env.DB.prepare('DELETE FROM login_versuche WHERE ip = ?').bind(ip).run();
+  const exp = now + (body.remember ? REMEMBER_H : SESSION_H) * 3600 * 1000;
+  const token = await sign(env, { iat: now, exp });
+  return json({ token, exp });
+}
+
+async function requireAuth(request, env) {
+  const h = request.headers.get('Authorization') || '';
+  const m = h.match(/^Bearer\s+(\S+)$/);
+  const p = m ? await verify(env, m[1]) : null;
+  if (!p) throw new HttpError(401, 'Nicht angemeldet oder Sitzung abgelaufen.');
+  return p;
+}
+
+const enc = new TextEncoder();
+let keyCache = null, keyFor = null;
+async function hmacKey(env) {
+  if (keyCache && keyFor === env.TOKEN_SECRET) return keyCache;
+  keyCache = await crypto.subtle.importKey('raw', enc.encode(env.TOKEN_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+  keyFor = env.TOKEN_SECRET;
+  return keyCache;
+}
+function b64u(buf) {
+  let s = ''; for (const x of new Uint8Array(buf)) s += String.fromCharCode(x);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function unb64u(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '=';
+  const bin = atob(s); const u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u;
+}
+async function sign(env, payload) {
+  const body = b64u(enc.encode(JSON.stringify(payload)));
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(env), enc.encode(body));
+  return body + '.' + b64u(sig);
+}
+async function verify(env, token) {
+  if (typeof token !== 'string' || token.length > 600) return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  try {
+    const ok = await crypto.subtle.verify('HMAC', await hmacKey(env), unb64u(parts[1]), enc.encode(parts[0]));
+    if (!ok) return null;
+    const p = JSON.parse(new TextDecoder().decode(unb64u(parts[0])));
+    if (typeof p.exp !== 'number' || p.exp < Date.now()) return null;
+    return p;
+  } catch { return null; }
+}
+async function passwordOk(env, input) {
+  const k = await hmacKey(env);
+  const a = await crypto.subtle.sign('HMAC', k, enc.encode('pw:' + input));
+  const b = await crypto.subtle.sign('HMAC', k, enc.encode('pw:' + env.APP_PASSWORD));
+  return crypto.subtle.timingSafeEqual(a, b);
+}
+function configured(env) {
+  return !!(env.DB && env.APP_PASSWORD && env.TOKEN_SECRET && env.TOKEN_SECRET.length >= 32);
+}
+
+/* ---------- Daten ---------- */
+async function getData(env) {
+  const res = await env.DB.batch([
+    env.DB.prepare("SELECT value FROM meta WHERE key = 'schema_version'"),
+    ...TABLES.map(t => env.DB.prepare(`SELECT * FROM ${t}`))
+  ]);
+  const tables = {};
+  TABLES.forEach((t, i) => { tables[t] = (res[i + 1].results || []).map(out); });
+  return json({ schema_version: res[0].results?.[0]?.value || '?', tables });
+}
+
+async function importRows(request, env) {
+  const body = await readJson(request);
+  if (body.wipe === true) {
+    await env.DB.batch(TABLES.map(t => env.DB.prepare(`DELETE FROM ${t}`)));
+    return json({ ok: true, wiped: true });
+  }
+  const rows = body.rows;
+  if (!rows || typeof rows !== 'object' || Array.isArray(rows)) throw new HttpError(400, 'Keine Datensätze übergeben');
+  const stmts = [];
+  for (const [t, list] of Object.entries(rows)) {
+    const table = tableOf(t);
+    if (!Array.isArray(list)) throw new HttpError(400, 'Ungültiges Importformat');
+    for (const r of list) stmts.push(upsertStmt(env, table, clean(table, r)));
+  }
+  if (stmts.length > IMPORT_MAX_ROWS) throw new HttpError(400, `Maximal ${IMPORT_MAX_ROWS} Datensätze pro Paket`);
+  if (stmts.length) await env.DB.batch(stmts);
+  return json({ ok: true, count: stmts.length });
+}
+
+function tableOf(name) {
+  if (!Object.prototype.hasOwnProperty.call(SCHEMA, name)) throw new HttpError(404, 'Unbekannte Tabelle');
+  return name;
+}
+
+function upsertStmt(env, table, row) {
+  const cols = Object.keys(row);
+  const ph = cols.map(() => '?').join(', ');
+  const upd = cols.filter(c => c !== 'id').map(c => `${c} = excluded.${c}`).join(', ');
+  const sql = `INSERT INTO ${table} (${cols.join(', ')}, updated_at) VALUES (${ph}, datetime('now')) ` +
+              `ON CONFLICT(id) DO UPDATE SET ${upd}, updated_at = datetime('now')`;
+  return env.DB.prepare(sql).bind(...cols.map(c => row[c]));
+}
+
+function clean(table, input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new HttpError(400, 'Ungültiger Datensatz');
+  const def = SCHEMA[table];
+  if (typeof input.id !== 'string' || !ID_RE.test(input.id)) throw new HttpError(400, 'Ungültige ID');
+  const row = { id: input.id };
+  for (const [col, spec] of Object.entries(def)) {
+    const req = spec.endsWith('!');
+    row[col] = conv(req ? spec.slice(0, -1) : spec, input[col], col, req);
+  }
+  const extra = {};
+  for (const [k, v] of Object.entries(input)) {
+    if (RESERVED.has(k) || Object.prototype.hasOwnProperty.call(def, k) || !KEY_RE.test(k)) continue;
+    if (v === null || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v))) extra[k] = v;
+    else if (typeof v === 'string') extra[k] = v.slice(0, TEXT_MAX);
+    if (Object.keys(extra).length > 40) throw new HttpError(400, 'Zu viele Zusatzfelder');
+  }
+  row.extra = JSON.stringify(extra);
+  if (row.extra.length > EXTRA_MAX) throw new HttpError(400, 'Zusatzfelder zu groß');
+  return row;
+}
+
+function conv(type, v, col, req) {
+  const bad = () => new HttpError(400, `Ungültiger Wert im Feld „${col}“`);
+  if (v === undefined || v === null || v === '') {
+    if (req) throw new HttpError(400, `Pflichtfeld „${col}“ fehlt`);
+    return null;
+  }
+  switch (type) {
+    case 'text':
+    case 'long': {
+      if (typeof v !== 'string' && typeof v !== 'number') throw bad();
+      return String(v).trim().slice(0, type === 'long' ? LONG_MAX : TEXT_MAX);
+    }
+    case 'money': {
+      const n = Number(v);
+      if (!Number.isFinite(n) || Math.abs(n) > 1e10) throw bad();
+      return Math.round(n * 100) / 100;
+    }
+    case 'int': {
+      const n = Number(v);
+      if (!Number.isInteger(n) || Math.abs(n) > 1e9) throw bad();
+      return n;
+    }
+    case 'bool': return (v === true || v === 1 || v === '1' || v === 'true') ? 1 : 0;
+    case 'date':
+      if (typeof v !== 'string' || !DATE_RE.test(v) || Number.isNaN(Date.parse(v + 'T00:00:00Z'))) throw bad();
+      return v;
+    case 'id':
+      if (typeof v !== 'string' || !ID_RE.test(v)) throw bad();
+      return v;
+  }
+  throw bad();
+}
+
+function out(row) {
+  let ex = {};
+  try { ex = JSON.parse(row.extra || '{}') || {}; } catch { ex = {}; }
+  const { extra, ...rest } = row;
+  return { ...ex, ...rest };
+}
+
+/* ---------- HTTP-Helfer ---------- */
+async function readJson(request, max = BODY_MAX) {
+  const len = Number(request.headers.get('Content-Length') || 0);
+  if (len > max) throw new HttpError(413, 'Anfrage zu groß');
+  const text = await request.text();
+  if (text.length > max) throw new HttpError(413, 'Anfrage zu groß');
+  if (!text) return {};
+  try {
+    const j = JSON.parse(text);
+    if (!j || typeof j !== 'object' || Array.isArray(j)) throw 0;
+    return j;
+  } catch { throw new HttpError(400, 'Ungültiges JSON'); }
+}
+function baseHeaders() {
+  return {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer'
+  };
+}
+function corsFor(origin) {
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Vary': 'Origin',
+    'Access-Control-Allow-Methods': 'GET, PUT, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400'
+  };
+}
+function json(data, status = 200, cors = {}) {
+  return new Response(JSON.stringify(data), { status, headers: { ...baseHeaders(), ...cors } });
+}
+function withCors(res, cors) {
+  const r = new Response(res.body, res);
+  for (const [k, v] of Object.entries(cors)) r.headers.set(k, v);
+  return r;
+}
